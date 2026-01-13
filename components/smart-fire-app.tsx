@@ -1,6 +1,8 @@
 import { MaterialIcons } from '@expo/vector-icons';
 import React, { useState } from 'react';
-import { Dimensions, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Button, Dimensions, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import MapView, { Marker } from 'react-native-maps';
+import * as Notifications from 'expo-notifications';
 
 export default function SmartFireApp() {
   const [activeTab, setActiveTab] = useState('home');
@@ -32,6 +34,26 @@ export default function SmartFireApp() {
   ]);
   const [showAlert, setShowAlert] = useState<any>(null);
   const [selectedAlertForMap, setSelectedAlertForMap] = useState<any>(null);
+
+  const notifyNow = async () => {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'It works! 🎉',
+        body: 'Local notification fired successfully.',
+      },
+      trigger: null,
+    });
+  };
+
+  const notifyIn10Seconds = async () => {
+    await Notifications.scheduleNotificationAsync({
+      content: {
+        title: 'Fire Alert 🔥',
+        body: 'This was scheduled 10 seconds ago',
+      },
+      trigger: { seconds: 10 },
+    });
+  };
 
   const getSeverityColor = (severity: string) => {
     const colors: Record<string, string> = {
@@ -391,9 +413,7 @@ export default function SmartFireApp() {
       );
     }
 
-    // For native platforms, show fallback since react-native-maps requires development build
-    // The require() call causes errors in Expo Go, so we'll use a web-compatible solution
-    // or show the fallback UI with clickable links to Google Maps
+    // For native platforms, use react-native-maps
     return (
       <View style={styles.pageContainer}>
         <Text style={styles.pageTitle}>Fire Alert Map</Text>
@@ -409,29 +429,29 @@ export default function SmartFireApp() {
           </View>
         )}
         
-        {/* Show Google Maps link for the selected alert or all alerts */}
         <View style={styles.mapContainer}>
-          <View style={styles.mapPlaceholder}>
-            <MaterialIcons name="map" size={64} color="#9ca3af" />
-            <Text style={styles.mapPlaceholderTitle}>Interactive Map</Text>
-            <Text style={styles.mapPlaceholderText}>
-              {selectedAlertForMap 
-                ? `View ${selectedAlertForMap.location} on Google Maps`
-                : 'Tap an alert below to view it on Google Maps'}
-            </Text>
-            {selectedAlertForMap && (
-              <Pressable
-                style={styles.mapButton}
-                onPress={() => {
-                  const url = `https://www.google.com/maps?q=${selectedAlertForMap.coordinates.lat},${selectedAlertForMap.coordinates.lng}&t=k&z=16`;
-                  Linking.openURL(url);
+          <MapView
+            key={selectedAlertForMap?.id || 'all-alerts'}
+            style={[styles.map, { height: mapHeight }]}
+            initialRegion={region}
+            mapType="satellite"
+            showsUserLocation={false}
+            showsMyLocationButton={false}
+          >
+            {alerts.map(alert => (
+              <Marker
+                key={alert.id}
+                coordinate={{
+                  latitude: alert.coordinates.lat,
+                  longitude: alert.coordinates.lng,
                 }}
-              >
-                <MaterialIcons name="open-in-new" size={20} color="white" />
-                <Text style={styles.mapButtonText}>Open in Google Maps</Text>
-              </Pressable>
-            )}
-          </View>
+                pinColor={getSeverityMarkerColor(alert.severity)}
+                title={alert.location}
+                description={`${alert.severity.toUpperCase()} • ${formatTime(alert.time)}`}
+                onPress={() => setSelectedAlertForMap(alert)}
+              />
+            ))}
+          </MapView>
         </View>
         <View style={styles.mapLegend}>
           <Text style={styles.mapLegendTitle}>Legend</Text>
@@ -513,6 +533,7 @@ export default function SmartFireApp() {
               <View style={styles.switchPlaceholder} />
             </View>
           </View>
+          <Button title="Test Notification" onPress={notifyNow} />
         </View>
 
         <View style={styles.settingsCard}>

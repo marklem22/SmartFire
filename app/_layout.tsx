@@ -10,7 +10,9 @@ import './globals.css';
 
 Notifications.setNotificationHandler({
   handleNotification: async () => ({
-    shouldShowAlert: true,
+    // iOS 15+: use banner/list instead of deprecated shouldShowAlert
+    shouldShowBanner: true,
+    shouldShowList: true,
     shouldPlaySound: true,
     shouldSetBadge: false,
   }),

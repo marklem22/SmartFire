@@ -10,10 +10,12 @@
     "preview": {
       "distribution": "internal"
     },
-    "production": {}
+    "production": {
+       "android": {
+        "buildType": "apk"
+    }}
   },
   "submit": {
     "production": {}
-  },
-  "projectId": "9d08e9a8-a128-4d37-8c59-8eeb35b62c1d"
+  }
 }

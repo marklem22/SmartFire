@@ -1,39 +1,107 @@
 import { MaterialIcons } from '@expo/vector-icons';
-import React, { useState } from 'react';
-import { Button, Dimensions, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
-import MapView, { Marker } from 'react-native-maps';
+import React, { ReactNode, useState, useEffect, useRef } from 'react';
+import { Button, Dimensions, Linking, Platform, Pressable, ScrollView, StyleSheet, Text, TextInput, View, Alert } from 'react-native';
 import * as Notifications from 'expo-notifications';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { MapView, Marker } from './map-imports';
 
-export default function SmartFireApp() {
+let WebView: any = null;
+try {
+  WebView = require('react-native-webview').WebView;
+} catch (e) {
+  // WebView not available
+}
+
+// Interface for ESP32 fire alert response
+interface ESP32FireAlert {
+  severity: string;
+  time: string;
+  latitude: number;
+  longitude: number;
+}
+
+// Interface for app alert
+interface FireAlert {
+  id: number;
+  severity: string;
+  location: string;
+  coordinates: { lat: number; lng: number };
+  time: Date;
+  status: 'active' | 'resolved';
+}
+
+export default function SmartFireApp(): ReactNode {
   const [activeTab, setActiveTab] = useState('home');
-  const [alerts, setAlerts] = useState([
-    {
-      id: 1,
-      severity: 'extreme',
-      location: 'Bacnotan Central Plaza, Ilocos',
-      coordinates: { lat: 16.7258, lng: 120.3642 },
-      time: new Date(Date.now() - 5 * 60000),
-      status: 'active'
-    },
-    {
-      id: 2,
-      severity: 'high',
-      location: 'San Fernando Market Area',
-      coordinates: { lat: 16.6197, lng: 120.3197 },
-      time: new Date(Date.now() - 15 * 60000),
-      status: 'active'
-    },
-    {
-      id: 3,
-      severity: 'moderate',
-      location: 'Residential Area, La Union',
-      coordinates: { lat: 16.6542, lng: 120.3456 },
-      time: new Date(Date.now() - 30 * 60000),
-      status: 'resolved'
-    }
-  ]);
+  const [alerts, setAlerts] = useState<FireAlert[]>([]);
   const [showAlert, setShowAlert] = useState<any>(null);
   const [selectedAlertForMap, setSelectedAlertForMap] = useState<any>(null);
+  const [esp32IpAddress, setEsp32IpAddress] = useState<string>('192.168.1.100'); // Default ESP32 IP
+  const [isPolling, setIsPolling] = useState<boolean>(false);
+  const [lastAlertHash, setLastAlertHash] = useState<string>('');
+  const [isSimulating, setIsSimulating] = useState<boolean>(false);
+  const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const simulationIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Test fire locations (Philippines coordinates around Mindanao region)
+  const testLocations = [
+    { lat: 16.6542, lng: 120.3456, name: 'Bacolod City' },
+    { lat: 16.8850, lng: 120.2726, name: 'Negros Occidental' },
+    { lat: 16.4247, lng: 120.5988, name: 'Antique Province' },
+    { lat: 16.9974, lng: 120.6821, name: 'Aklan Province' },
+    { lat: 16.5952, lng: 120.1949, name: 'Silay City' },
+    { lat: 16.7471, lng: 120.4097, name: 'Cadiz City' },
+    { lat: 16.5453, lng: 120.6236, name: 'Iloilo City' },
+  ];
+
+  /**
+   * Generates a fake fire alert for testing
+   */
+  const generateTestFireAlert = () => {
+    const location = testLocations[Math.floor(Math.random() * testLocations.length)];
+    const severities: Array<'low' | 'moderate' | 'high' | 'extreme'> = ['low', 'moderate', 'high', 'extreme'];
+    const severity = severities[Math.floor(Math.random() * severities.length)];
+    
+    const newAlert: FireAlert = {
+      id: Date.now(),
+      severity: severity,
+      location: `${location.name} (SIM)`,
+      coordinates: {
+        lat: location.lat + (Math.random() - 0.5) * 0.02, // Random variation within ~1km
+        lng: location.lng + (Math.random() - 0.5) * 0.02,
+      },
+      time: new Date(),
+      status: 'active',
+    };
+
+    setAlerts(prevAlerts => [newAlert, ...prevAlerts]);
+    setShowAlert(newAlert);
+    triggerFireAlertNotification(newAlert);
+  };
+
+  /**
+   * Starts simulation mode - generates random fire alerts
+   */
+  const startSimulation = () => {
+    setIsSimulating(true);
+    // Generate first alert immediately
+    generateTestFireAlert();
+    
+    // Then generate new alerts every 5-10 seconds
+    simulationIntervalRef.current = setInterval(() => {
+      generateTestFireAlert();
+    }, 5000 + Math.random() * 5000);
+  };
+
+  /**
+   * Stops simulation mode
+   */
+  const stopSimulation = () => {
+    setIsSimulating(false);
+    if (simulationIntervalRef.current) {
+      clearInterval(simulationIntervalRef.current);
+      simulationIntervalRef.current = null;
+    }
+  };
 
   const notifyNow = async () => {
     await Notifications.scheduleNotificationAsync({
@@ -45,15 +113,226 @@ export default function SmartFireApp() {
     });
   };
 
-  const notifyIn10Seconds = async () => {
+  // Removed unused delayed notification function to satisfy typings
+
+  // ==================== ESP32 POLLING FUNCTIONS ====================
+  
+  /**
+   * Polls ESP32 endpoint every second to check for fire alerts
+   * This function runs continuously when the app is active
+   */
+  const pollESP32Endpoint = async () => {
+    if (!esp32IpAddress || Platform.OS === 'web') {
+      return; // Skip polling on web or if no IP configured
+    }
+
+    try {
+      const url = `http://${esp32IpAddress}/fire-alert`;
+      const response = await fetch(url, {
+        method: 'GET',
+        headers: {
+          'Accept': 'application/json',
+        },
+        // Timeout after 2 seconds
+        signal: AbortSignal.timeout(2000),
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data: ESP32FireAlert = await response.json();
+      
+      // Check if fire is detected (severity is not "NONE")
+      if (data.severity && data.severity !== 'NONE') {
+        // Create hash to detect new alerts
+        const alertHash = `${data.severity}-${data.latitude}-${data.longitude}-${data.time}`;
+        
+        // Only process if this is a new alert
+        if (alertHash !== lastAlertHash) {
+          setLastAlertHash(alertHash);
+          
+          // Parse timestamp from ESP32
+          const alertTime = parseESP32Timestamp(data.time);
+          
+          // Create new alert object
+          const newAlert: FireAlert = {
+            id: Date.now(), // Use timestamp as unique ID
+            severity: data.severity.toLowerCase(),
+            location: `GPS: ${data.latitude.toFixed(4)}, ${data.longitude.toFixed(4)}`,
+            coordinates: {
+              lat: data.latitude,
+              lng: data.longitude,
+            },
+            time: alertTime,
+            status: 'active',
+          };
+
+          // Add alert to state
+          setAlerts(prevAlerts => {
+            // Check if alert already exists (same coordinates within 10 meters)
+            const exists = prevAlerts.some(alert => 
+              Math.abs(alert.coordinates.lat - newAlert.coordinates.lat) < 0.0001 &&
+              Math.abs(alert.coordinates.lng - newAlert.coordinates.lng) < 0.0001 &&
+              alert.status === 'active'
+            );
+            
+            if (!exists) {
+              // Trigger notification
+              triggerFireAlertNotification(newAlert);
+              
+              // Show popup alert
+              setShowAlert(newAlert);
+              
+              // Return new alerts array with new alert at the beginning
+              return [newAlert, ...prevAlerts];
+            }
+            return prevAlerts;
+          });
+        }
+      }
+    } catch (error: any) {
+      // Silently handle errors (network issues, ESP32 offline, etc.)
+      // Uncomment for debugging:
+      // console.log('ESP32 polling error:', error.message);
+    }
+  };
+
+  /**
+   * Triggers a local notification based on fire severity
+   * Different severity levels have different notification styles
+   */
+  const triggerFireAlertNotification = async (alert: FireAlert) => {
+    const severityConfig = {
+      low: {
+        title: 'Fire Alert - LOW 🔥',
+        body: `Weak flame detected at ${alert.location}`,
+        sound: true,
+        priority: Notifications.AndroidNotificationPriority.DEFAULT,
+      },
+      moderate: {
+        title: 'Fire Alert - MODERATE 🔥',
+        body: `Moderate flame detected at ${alert.location}`,
+        sound: true,
+        priority: Notifications.AndroidNotificationPriority.HIGH,
+      },
+      high: {
+        title: 'Fire Alert - HIGH 🔥',
+        body: `Strong flame detected at ${alert.location}`,
+        sound: true,
+        priority: Notifications.AndroidNotificationPriority.HIGH,
+      },
+      extreme: {
+        title: 'EMERGENCY - EXTREME FIRE ALERT 🔥',
+        body: `CRITICAL: Extreme flame detected at ${alert.location}`,
+        sound: true,
+        priority: Notifications.AndroidNotificationPriority.MAX,
+      },
+    };
+
+    const config = severityConfig[alert.severity as keyof typeof severityConfig] || severityConfig.low;
+
     await Notifications.scheduleNotificationAsync({
       content: {
-        title: 'Fire Alert 🔥',
-        body: 'This was scheduled 10 seconds ago',
+        title: config.title,
+        body: config.body,
+        sound: config.sound,
+        data: {
+          alertId: alert.id,
+          severity: alert.severity,
+          coordinates: alert.coordinates,
+        },
       },
-      trigger: { seconds: 10 },
+      trigger: null, // Fire immediately
     });
   };
+
+  /**
+   * Parses timestamp from ESP32 format "YYYY-MM-DD HH:MM" to Date object
+   */
+  const parseESP32Timestamp = (timestamp: string): Date => {
+    try {
+      // ESP32 format: "2026-01-22 21:35"
+      const [datePart, timePart] = timestamp.split(' ');
+      const [year, month, day] = datePart.split('-').map(Number);
+      const [hours, minutes] = timePart.split(':').map(Number);
+      
+      return new Date(year, month - 1, day, hours, minutes);
+    } catch (error) {
+      // If parsing fails, return current time
+      return new Date();
+    }
+  };
+
+  /**
+   * Starts polling ESP32 endpoint every second
+   */
+  const startPolling = () => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+    }
+    
+    setIsPolling(true);
+    // Poll immediately, then every second
+    pollESP32Endpoint();
+    pollingIntervalRef.current = setInterval(pollESP32Endpoint, 1000);
+  };
+
+  /**
+   * Stops polling ESP32 endpoint
+   */
+  const stopPolling = () => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+    setIsPolling(false);
+  };
+
+  /**
+   * Saves ESP32 IP address to AsyncStorage
+   */
+  const saveESP32IP = async (ip: string) => {
+    try {
+      await AsyncStorage.setItem('esp32_ip_address', ip);
+      setEsp32IpAddress(ip);
+      Alert.alert('Success', 'ESP32 IP address saved!');
+    } catch (error) {
+      Alert.alert('Error', 'Failed to save IP address');
+    }
+  };
+
+  /**
+   * Loads ESP32 IP address from AsyncStorage on app start
+   */
+  useEffect(() => {
+    const loadESP32IP = async () => {
+      try {
+        const savedIP = await AsyncStorage.getItem('esp32_ip_address');
+        if (savedIP) {
+          setEsp32IpAddress(savedIP);
+        }
+      } catch (error) {
+        console.log('Error loading ESP32 IP:', error);
+      }
+    };
+    
+    loadESP32IP();
+  }, []);
+
+  /**
+   * Start/stop polling when IP address changes or component mounts
+   */
+  useEffect(() => {
+    if (esp32IpAddress && Platform.OS !== 'web') {
+      startPolling();
+    }
+    
+    // Cleanup on unmount
+    return () => {
+      stopPolling();
+    };
+  }, [esp32IpAddress]);
 
   const getSeverityColor = (severity: string) => {
     const colors: Record<string, string> = {
@@ -331,7 +610,26 @@ export default function SmartFireApp() {
 
       return (
         <View style={styles.pageContainer}>
-          <Text style={styles.pageTitle}>Fire Alert Map (Satellite View)</Text>
+          <View style={styles.mapHeader}>
+            <Text style={styles.pageTitle}>Fire Alert Map (Satellite View)</Text>
+            <View style={styles.mapStatusBadge}>
+              <View style={[styles.statusDot, { backgroundColor: isPolling ? '#22c55e' : '#ef4444' }]} />
+              <Text style={styles.mapStatusText}>
+                {isPolling ? 'Monitoring Active' : 'Monitoring Inactive'}
+              </Text>
+            </View>
+          </View>
+          {selectedAlertForMap && (
+            <View style={styles.selectedAlertBanner}>
+              <MaterialIcons name="place" size={20} color="#dc2626" />
+              <Text style={styles.selectedAlertText}>
+                Viewing: {selectedAlertForMap.location}
+              </Text>
+              <Pressable onPress={() => setSelectedAlertForMap(null)}>
+                <MaterialIcons name="close" size={20} color="#6b7280" />
+              </Pressable>
+            </View>
+          )}
           <View style={styles.mapContainer}>
             <iframe
               width="100%"
@@ -376,47 +674,165 @@ export default function SmartFireApp() {
             </View>
           )}
           <View style={styles.alertListOnMap}>
-            <Text style={styles.mapLegendTitle}>Alert Locations</Text>
-            {alerts.map(alert => {
-              const googleMapsUrl = `https://www.google.com/maps?q=${alert.coordinates.lat},${alert.coordinates.lng}&t=k`;
-              const isSelected = selectedAlertForMap?.id === alert.id;
-              return (
-                <Pressable
-                  key={alert.id}
-                  onPress={() => {
-                    if (isSelected) {
-                      setSelectedAlertForMap(null);
-                    } else {
-                      setSelectedAlertForMap(alert);
-                    }
-                  }}
-                  style={[
-                    styles.mapAlertItem,
-                    isSelected && styles.mapAlertItemSelected
-                  ]}
-                >
-                  <View style={[styles.mapAlertDot, { backgroundColor: getSeverityMarkerColor(alert.severity) }]} />
-                  <View style={styles.mapAlertContent}>
-                    <Text style={styles.mapAlertLocation}>{alert.location}</Text>
-                    <Text style={styles.mapAlertSeverity}>
-                      {alert.severity.toUpperCase()} • {alert.coordinates.lat.toFixed(4)}, {alert.coordinates.lng.toFixed(4)}
-                    </Text>
-                  </View>
-                  <Pressable onPress={() => Linking.openURL(googleMapsUrl)}>
-                    <MaterialIcons name="open-in-new" size={20} color="#6b7280" />
+            <Text style={styles.mapLegendTitle}>Fire Alert Locations</Text>
+            {alerts.length === 0 ? (
+              <View style={styles.noAlertsContainer}>
+                <MaterialIcons name="check-circle" size={24} color="#22c55e" />
+                <Text style={styles.noAlertsText}>No fire detected</Text>
+                <Text style={styles.noAlertsSubtext}>
+                  Markers will appear here when IR flame sensor detects fire
+                </Text>
+              </View>
+            ) : (
+              alerts.map(alert => {
+                const googleMapsUrl = `https://www.google.com/maps?q=${alert.coordinates.lat},${alert.coordinates.lng}&t=k`;
+                const isSelected = selectedAlertForMap?.id === alert.id;
+                return (
+                  <Pressable
+                    key={alert.id}
+                    onPress={() => {
+                      if (isSelected) {
+                        setSelectedAlertForMap(null);
+                      } else {
+                        setSelectedAlertForMap(alert);
+                      }
+                    }}
+                    style={[
+                      styles.mapAlertItem,
+                      isSelected && styles.mapAlertItemSelected
+                    ]}
+                  >
+                    <View style={[styles.mapAlertDot, { backgroundColor: getSeverityMarkerColor(alert.severity) }]} />
+                    <View style={styles.mapAlertContent}>
+                      <Text style={styles.mapAlertLocation}>{alert.location}</Text>
+                      <Text style={styles.mapAlertSeverity}>
+                        {alert.severity.toUpperCase()} • {alert.coordinates.lat.toFixed(4)}, {alert.coordinates.lng.toFixed(4)}
+                      </Text>
+                    </View>
+                    <Pressable onPress={() => Linking.openURL(googleMapsUrl)}>
+                      <MaterialIcons name="open-in-new" size={20} color="#6b7280" />
+                    </Pressable>
                   </Pressable>
-                </Pressable>
-              );
-            })}
+                );
+              })
+            )}
           </View>
         </View>
       );
     }
 
-    // For native platforms, use react-native-maps
+    // For native platforms, use react-native-maps if available, otherwise show web-based map
+    if (!MapView || !Marker) {
+      // Fallback: use web-based map view for native platforms
+      return (
+        <View style={styles.pageContainer}>
+          <View style={styles.mapHeader}>
+            <Text style={styles.pageTitle}>Fire Alert Map (Satellite View)</Text>
+            <View style={styles.mapStatusBadge}>
+              <View style={[styles.statusDot, { backgroundColor: isPolling ? '#22c55e' : '#ef4444' }]} />
+              <Text style={styles.mapStatusText}>
+                {isPolling ? 'Monitoring Active' : 'Monitoring Inactive'}
+              </Text>
+            </View>
+          </View>
+          {selectedAlertForMap && (
+            <View style={styles.selectedAlertBanner}>
+              <MaterialIcons name="place" size={20} color="#dc2626" />
+              <Text style={styles.selectedAlertText}>
+                Viewing: {selectedAlertForMap.location}
+              </Text>
+              <Pressable onPress={() => setSelectedAlertForMap(null)}>
+                <MaterialIcons name="close" size={20} color="#6b7280" />
+              </Pressable>
+            </View>
+          )}
+          <View style={styles.mapContainer}>
+            <WebView
+              source={{ uri: `https://www.google.com/maps?q=${region.latitude},${region.longitude}&z=14&t=k&output=embed` }}
+              style={{ width: '100%', height: mapHeight }}
+              scalesPageToFit
+            />
+          </View>
+          <View style={styles.mapLegend}>
+            <Text style={styles.mapLegendTitle}>Legend</Text>
+            <View style={styles.mapLegendItems}>
+              <View style={styles.mapLegendItem}>
+                <View style={[styles.mapLegendDot, { backgroundColor: '#9333ea' }]} />
+                <Text style={styles.mapLegendText}>Extreme</Text>
+              </View>
+              <View style={styles.mapLegendItem}>
+                <View style={[styles.mapLegendDot, { backgroundColor: '#ef4444' }]} />
+                <Text style={styles.mapLegendText}>High</Text>
+              </View>
+              <View style={styles.mapLegendItem}>
+                <View style={[styles.mapLegendDot, { backgroundColor: '#f97316' }]} />
+                <Text style={styles.mapLegendText}>Moderate</Text>
+              </View>
+              <View style={styles.mapLegendItem}>
+                <View style={[styles.mapLegendDot, { backgroundColor: '#eab308' }]} />
+                <Text style={styles.mapLegendText}>Low</Text>
+              </View>
+            </View>
+          </View>
+          <View style={styles.alertListOnMap}>
+            <Text style={styles.mapLegendTitle}>Fire Alert Locations</Text>
+            {alerts.length === 0 ? (
+              <View style={styles.noAlertsContainer}>
+                <MaterialIcons name="check-circle" size={24} color="#22c55e" />
+                <Text style={styles.noAlertsText}>No fire detected</Text>
+                <Text style={styles.noAlertsSubtext}>
+                  Markers will appear here when IR flame sensor detects fire
+                </Text>
+              </View>
+            ) : (
+              alerts.map(alert => {
+                const googleMapsUrl = `https://www.google.com/maps?q=${alert.coordinates.lat},${alert.coordinates.lng}&t=k&z=16`;
+                const isSelected = selectedAlertForMap?.id === alert.id;
+                return (
+                  <Pressable
+                    key={alert.id}
+                    onPress={() => {
+                      if (isSelected) {
+                        setSelectedAlertForMap(null);
+                      } else {
+                        setSelectedAlertForMap(alert);
+                      }
+                    }}
+                    style={[
+                      styles.mapAlertItem,
+                      isSelected && styles.mapAlertItemSelected
+                    ]}
+                  >
+                    <View style={[styles.mapAlertDot, { backgroundColor: getSeverityMarkerColor(alert.severity) }]} />
+                    <View style={styles.mapAlertContent}>
+                      <Text style={styles.mapAlertLocation}>{alert.location}</Text>
+                      <Text style={styles.mapAlertSeverity}>
+                        {alert.severity.toUpperCase()} • {alert.coordinates.lat.toFixed(4)}, {alert.coordinates.lng.toFixed(4)}
+                      </Text>
+                    </View>
+                    <Pressable onPress={() => Linking.openURL(googleMapsUrl)}>
+                      <MaterialIcons name="open-in-new" size={20} color="#6b7280" />
+                    </Pressable>
+                  </Pressable>
+                );
+              })
+            )}
+          </View>
+        </View>
+      );
+    }
+
     return (
       <View style={styles.pageContainer}>
-        <Text style={styles.pageTitle}>Fire Alert Map</Text>
+        <View style={styles.mapHeader}>
+          <Text style={styles.pageTitle}>Fire Alert Map (Satellite View)</Text>
+          <View style={styles.mapStatusBadge}>
+            <View style={[styles.statusDot, { backgroundColor: isPolling ? '#22c55e' : '#ef4444' }]} />
+            <Text style={styles.mapStatusText}>
+              {isPolling ? 'Monitoring Active' : 'Monitoring Inactive'}
+            </Text>
+          </View>
+        </View>
         {selectedAlertForMap && (
           <View style={styles.selectedAlertBanner}>
             <MaterialIcons name="place" size={20} color="#dc2626" />
@@ -429,14 +845,14 @@ export default function SmartFireApp() {
           </View>
         )}
         
-        <View style={styles.mapContainer}>
+        <View style={[styles.mapContainer, { height: mapHeight }]}>
           <MapView
             key={selectedAlertForMap?.id || 'all-alerts'}
-            style={[styles.map, { height: mapHeight }]}
-            initialRegion={region}
+            style={styles.map}
+            region={region}
             mapType="satellite"
-            showsUserLocation={false}
-            showsMyLocationButton={false}
+            showsUserLocation={true}
+            showsMyLocationButton={true}
           >
             {alerts.map(alert => (
               <Marker
@@ -475,88 +891,185 @@ export default function SmartFireApp() {
           </View>
         </View>
         <View style={styles.alertListOnMap}>
-          <Text style={styles.mapLegendTitle}>Alert Locations</Text>
-          {alerts.map(alert => {
-            const googleMapsUrl = `https://www.google.com/maps?q=${alert.coordinates.lat},${alert.coordinates.lng}&t=k&z=16`;
-            const isSelected = selectedAlertForMap?.id === alert.id;
-            return (
-              <Pressable
-                key={alert.id}
-                onPress={() => {
-                  if (isSelected) {
-                    setSelectedAlertForMap(null);
-                  } else {
-                    setSelectedAlertForMap(alert);
-                  }
-                }}
-                style={[
-                  styles.mapAlertItem,
-                  isSelected && styles.mapAlertItemSelected
-                ]}
-              >
-                <View style={[styles.mapAlertDot, { backgroundColor: getSeverityMarkerColor(alert.severity) }]} />
-                <View style={styles.mapAlertContent}>
-                  <Text style={styles.mapAlertLocation}>{alert.location}</Text>
-                  <Text style={styles.mapAlertSeverity}>
-                    {alert.severity.toUpperCase()} • {alert.coordinates.lat.toFixed(4)}, {alert.coordinates.lng.toFixed(4)}
-                  </Text>
-                </View>
+          <Text style={styles.mapLegendTitle}>Fire Alert Locations</Text>
+          {alerts.length === 0 ? (
+            <View style={styles.noAlertsContainer}>
+              <MaterialIcons name="check-circle" size={24} color="#22c55e" />
+              <Text style={styles.noAlertsText}>No fire detected</Text>
+              <Text style={styles.noAlertsSubtext}>
+                Markers will appear here when IR flame sensor detects fire
+              </Text>
+            </View>
+          ) : (
+            alerts.map(alert => {
+              const googleMapsUrl = `https://www.google.com/maps?q=${alert.coordinates.lat},${alert.coordinates.lng}&t=k&z=16`;
+              const isSelected = selectedAlertForMap?.id === alert.id;
+              return (
+                <Pressable
+                  key={alert.id}
+                  onPress={() => {
+                    if (isSelected) {
+                      setSelectedAlertForMap(null);
+                    } else {
+                      setSelectedAlertForMap(alert);
+                    }
+                  }}
+                  style={[
+                    styles.mapAlertItem,
+                    isSelected && styles.mapAlertItemSelected
+                  ]}
+                >
+                  <View style={[styles.mapAlertDot, { backgroundColor: getSeverityMarkerColor(alert.severity) }]} />
+                  <View style={styles.mapAlertContent}>
+                    <Text style={styles.mapAlertLocation}>{alert.location}</Text>
+                    <Text style={styles.mapAlertSeverity}>
+                      {alert.severity.toUpperCase()} • {alert.coordinates.lat.toFixed(4)}, {alert.coordinates.lng.toFixed(4)}
+                    </Text>
+                  </View>
                 <Pressable onPress={() => Linking.openURL(googleMapsUrl)}>
                   <MaterialIcons name="open-in-new" size={20} color="#6b7280" />
                 </Pressable>
               </Pressable>
             );
-          })}
+          })
+          )}
         </View>
       </View>
     );
   };
 
-  const SettingsPage = () => (
-    <View style={styles.pageContainer}>
-      <Text style={styles.pageTitle}>Settings</Text>
-      
-      <View style={styles.settingsSection}>
-        <View style={styles.settingsCard}>
-          <Text style={styles.settingsCardTitle}>Notifications</Text>
-          <View style={styles.settingsList}>
-            <View style={styles.settingItem}>
-              <Text style={styles.settingLabel}>Push Notifications</Text>
-              <View style={styles.switchPlaceholder} />
-            </View>
-            <View style={styles.settingItem}>
-              <Text style={styles.settingLabel}>Sound Alerts</Text>
-              <View style={styles.switchPlaceholder} />
-            </View>
-            <View style={styles.settingItem}>
-              <Text style={styles.settingLabel}>Vibration</Text>
-              <View style={styles.switchPlaceholder} />
+  const SettingsPage = () => {
+    const [ipInput, setIpInput] = useState(esp32IpAddress);
+    
+    return (
+      <View style={styles.pageContainer}>
+        <Text style={styles.pageTitle}>Settings</Text>
+        
+        <View style={styles.settingsSection}>
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsCardTitle}>ESP32 Configuration</Text>
+            <View style={styles.settingsList}>
+              <View style={styles.settingItem}>
+                <Text style={styles.settingLabel}>ESP32 IP Address</Text>
+              </View>
+              <TextInput
+                style={styles.ipInput}
+                value={ipInput}
+                onChangeText={setIpInput}
+                placeholder="192.168.1.100"
+                keyboardType="numeric"
+                autoCapitalize="none"
+                autoCorrect={false}
+              />
+              <View style={styles.buttonContainer}>
+                <Button 
+                  title="Save IP Address" 
+                  onPress={() => saveESP32IP(ipInput)} 
+                />
+              </View>
+              <View style={styles.statusContainer}>
+                <Text style={styles.statusText}>
+                  Status: {isPolling ? '🟢 Polling Active' : '🔴 Polling Stopped'}
+                </Text>
+                <Text style={styles.statusSubtext}>
+                  Current IP: {esp32IpAddress}
+                </Text>
+              </View>
             </View>
           </View>
-          <Button title="Test Notification" onPress={notifyNow} />
-        </View>
 
-        <View style={styles.settingsCard}>
-          <Text style={styles.settingsCardTitle}>Alert Preferences</Text>
-          <View style={styles.settingsList}>
-            <View style={styles.settingItem}>
-              <Text style={styles.settingLabel}>Low Severity</Text>
-              <View style={styles.switchPlaceholder} />
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsCardTitle}>Notifications</Text>
+            <View style={styles.settingsList}>
+              <View style={styles.settingItem}>
+                <Text style={styles.settingLabel}>Push Notifications</Text>
+                <View style={styles.switchPlaceholder} />
+              </View>
+              <View style={styles.settingItem}>
+                <Text style={styles.settingLabel}>Sound Alerts</Text>
+                <View style={styles.switchPlaceholder} />
+              </View>
+              <View style={styles.settingItem}>
+                <Text style={styles.settingLabel}>Vibration</Text>
+                <View style={styles.switchPlaceholder} />
+              </View>
             </View>
-            <View style={styles.settingItem}>
-              <Text style={styles.settingLabel}>Moderate Severity</Text>
-              <View style={styles.switchPlaceholder} />
-            </View>
-            <View style={styles.settingItem}>
-              <Text style={styles.settingLabel}>High Severity</Text>
-              <View style={styles.switchPlaceholder} />
-            </View>
-            <View style={styles.settingItem}>
-              <Text style={styles.settingLabel}>Extreme Severity</Text>
-              <View style={styles.switchPlaceholder} />
-            </View>
+            <Button title="Test Notification" onPress={notifyNow} />
           </View>
-        </View>
+
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsCardTitle}>Fire Detection Simulator</Text>
+            <Text style={styles.settingsCardDescription}>
+              Test the app with simulated fire alerts at different locations
+            </Text>
+            <View style={styles.buttonContainer}>
+              <Button 
+                title={isSimulating ? 'Stop Simulation' : 'Start Simulation'} 
+                onPress={() => {
+                  if (isSimulating) {
+                    stopSimulation();
+                  } else {
+                    startSimulation();
+                  }
+                }}
+                color={isSimulating ? '#ef4444' : '#22c55e'}
+              />
+            </View>
+            {isSimulating && (
+              <View style={styles.statusContainer}>
+                <Text style={styles.statusText}>
+                  🔥 Simulation Active
+                </Text>
+                <Text style={styles.statusSubtext}>
+                  Generating random fire alerts every 5-10 seconds
+                </Text>
+              </View>
+            )}
+            <Button 
+              title="Generate Single Alert" 
+              onPress={generateTestFireAlert}
+            />
+          </View>
+
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsCardTitle}>Data Management</Text>
+            <Text style={styles.settingsCardDescription}>
+              Clear all alert history and test data
+            </Text>
+            <Pressable 
+              style={[styles.buttonContainer, styles.clearButtonWrapper]}
+              onPress={() => {
+                Alert.alert(
+                  'Clear Alert History',
+                  'Are you sure you want to delete all alerts? This action cannot be undone.',
+                  [
+                    {
+                      text: 'Cancel',
+                      onPress: () => {},
+                      style: 'cancel',
+                    },
+                    {
+                      text: 'Clear All',
+                      onPress: () => {
+                        setAlerts([]);
+                        setShowAlert(null);
+                        setSelectedAlertForMap(null);
+                        Alert.alert('Success', 'All alert history has been cleared');
+                      },
+                      style: 'destructive',
+                    },
+                  ]
+                );
+              }}
+            >
+              <Text style={styles.clearButtonText}>Clear Alert History</Text>
+            </Pressable>
+            {alerts.length > 0 && (
+              <Text style={styles.alertCountText}>
+                {alerts.length} alert(s) in history
+              </Text>
+            )}
+          </View>
 
         <View style={styles.settingsCard}>
           <Text style={styles.settingsCardTitle}>About</Text>
@@ -568,7 +1081,8 @@ export default function SmartFireApp() {
         </View>
       </View>
     </View>
-  );
+    );
+  };
 
   return (
     <View style={styles.container}>
@@ -807,6 +1321,11 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#111827',
   },
+  settingsCardDescription: {
+    fontSize: 13,
+    color: '#6b7280',
+    marginBottom: 8,
+  },
   settingsList: {
     gap: 12,
   },
@@ -965,8 +1484,8 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   map: {
+    flex: 1,
     width: '100%',
-    minHeight: 400,
   },
   mapLegend: {
     backgroundColor: 'white',
@@ -1076,6 +1595,49 @@ const styles = StyleSheet.create({
     borderColor: '#dc2626',
     borderWidth: 2,
   },
+  mapHeader: {
+    gap: 8,
+    marginBottom: 8,
+  },
+  mapStatusBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: '#f9fafb',
+    borderRadius: 12,
+    alignSelf: 'flex-start',
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  mapStatusText: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: '#374151',
+  },
+  noAlertsContainer: {
+    backgroundColor: '#f0fdf4',
+    borderRadius: 8,
+    padding: 20,
+    alignItems: 'center',
+    gap: 8,
+    borderWidth: 1,
+    borderColor: '#86efac',
+  },
+  noAlertsText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#16a34a',
+  },
+  noAlertsSubtext: {
+    fontSize: 13,
+    color: '#15803d',
+    textAlign: 'center',
+  },
   mapPlaceholder: {
     width: '100%',
     height: '100%',
@@ -1112,5 +1674,53 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '600',
     color: 'white',
+  },
+  ipInput: {
+    borderWidth: 1,
+    borderColor: '#d1d5db',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 16,
+    backgroundColor: 'white',
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  buttonContainer: {
+    marginTop: 8,
+    marginBottom: 8,
+  },
+  statusContainer: {
+    marginTop: 12,
+    padding: 12,
+    backgroundColor: '#f9fafb',
+    borderRadius: 8,
+    gap: 4,
+  },
+  statusText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: '#111827',
+  },
+  statusSubtext: {
+    fontSize: 12,
+    color: '#6b7280',
+  },
+  clearButtonWrapper: {
+    backgroundColor: '#fee2e2',
+    borderRadius: 8,
+    overflow: 'hidden',
+  },
+  clearButtonText: {
+    fontSize: 16,
+    fontWeight: '600',
+    color: '#dc2626',
+    textAlign: 'center',
+    paddingVertical: 12,
+  },
+  alertCountText: {
+    fontSize: 12,
+    color: '#6b7280',
+    marginTop: 8,
+    textAlign: 'center',
   },
 });
